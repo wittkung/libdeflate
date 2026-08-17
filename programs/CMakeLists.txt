@@ -18,6 +18,14 @@ check_c_source_compiles("#include <sys/types.h>
                          #include <sys/stat.h>
                          int main() { struct stat st; (void)st.st_atim; }"
                          HAVE_STAT_NANOSECOND_PRECISION)
+
+set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads)
+if(Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
+    set(HAVE_PTHREAD 1)
+endif()
+
 configure_file(config.h.in config.h)
 
 # Build a utility library for the programs.  This library is not installed.
@@ -44,6 +52,9 @@ endif()
 if(LIBDEFLATE_BUILD_GZIP)
     add_executable(libdeflate-gzip gzip.c)
     target_link_libraries(libdeflate-gzip PRIVATE libdeflate_prog_utils)
+    if(HAVE_PTHREAD)
+        target_link_libraries(libdeflate-gzip PRIVATE Threads::Threads)
+    endif()
     if(LIBDEFLATE_INSTALL)
         install(TARGETS libdeflate-gzip DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
@@ -67,6 +78,9 @@ if(LIBDEFLATE_BUILD_GZIP)
         # Just compile gzip.c again to build libdeflate-gunzip.
         add_executable(libdeflate-gunzip gzip.c)
         target_link_libraries(libdeflate-gunzip PRIVATE libdeflate_prog_utils)
+        if(HAVE_PTHREAD)
+            target_link_libraries(libdeflate-gunzip PRIVATE Threads::Threads)
+        endif()
         if(LIBDEFLATE_INSTALL)
             install(TARGETS libdeflate-gunzip DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()

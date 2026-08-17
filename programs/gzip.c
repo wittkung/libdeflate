@@ -35,6 +35,9 @@
 #  include <sys/time.h>
 #  include <unistd.h>
 #  include <utime.h>
+#  ifdef HAVE_PTHREAD
+#    include <pthread.h>
+#  endif
 #endif
 
 #define GZIP_MIN_HEADER_SIZE	10
@@ -50,16 +53,25 @@ struct options {
 	bool keep;
 	bool test;
 	int compression_level;
+	int num_threads;
 	const tchar *suffix;
 };
 
+#ifdef HAVE_PTHREAD
+static const tchar *const optstring = T("1::2::3::4::5::6::7::8::9::cdfhknp:qS:tV");
+#else
 static const tchar *const optstring = T("1::2::3::4::5::6::7::8::9::cdfhknqS:tV");
+#endif
 
 static void
 show_usage(FILE *fp)
 {
 	fprintf(fp,
+#ifdef HAVE_PTHREAD
+"Usage: %"TS" [-LEVEL] [-cdfhkqtV] [-p NUM] [-S SUF] FILE...\n"
+#else
 "Usage: %"TS" [-LEVEL] [-cdfhkqtV] [-S SUF] FILE...\n"
+#endif
 "Compress or decompress the specified FILEs.\n"
 "\n"
 "Options:\n"
@@ -73,6 +85,9 @@ show_usage(FILE *fp)
 "            with gunzip -c, pass through non-gzipped data\n"
 "  -h        print this help\n"
 "  -k        don't delete input files\n"
+#ifdef HAVE_PTHREAD
+"  -p NUM    number of worker threads to use (default: 1)\n"
+#endif
 "  -q        suppress warnings\n"
 "  -S SUF    use suffix SUF instead of .gz\n"
 "  -t        test file integrity\n"
@@ -547,6 +562,75 @@ out_free_newpath:
 	return ret;
 }
 
+#ifdef HAVE_PTHREAD
+struct thread_worker_ctx {
+	const struct options *options;
+	tchar **argv;
+	int argc;
+	int next_file_idx;
+	pthread_mutex_t mutex;
+	int overall_ret;
+};
+
+static void *
+compress_worker_thread(void *arg)
+{
+	struct thread_worker_ctx *ctx = arg;
+	struct libdeflate_compressor *c = alloc_compressor(ctx->options->compression_level);
+	if (c == NULL)
+		return NULL;
+
+	for (;;) {
+		int file_idx;
+		int ret;
+
+		pthread_mutex_lock(&ctx->mutex);
+		file_idx = ctx->next_file_idx++;
+		pthread_mutex_unlock(&ctx->mutex);
+
+		if (file_idx >= ctx->argc)
+			break;
+
+		ret = -compress_file(c, ctx->argv[file_idx], ctx->options);
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->overall_ret |= ret;
+		pthread_mutex_unlock(&ctx->mutex);
+	}
+
+	libdeflate_free_compressor(c);
+	return NULL;
+}
+
+static void *
+decompress_worker_thread(void *arg)
+{
+	struct thread_worker_ctx *ctx = arg;
+	struct libdeflate_decompressor *d = alloc_decompressor();
+	if (d == NULL)
+		return NULL;
+
+	for (;;) {
+		int file_idx;
+		int ret;
+
+		pthread_mutex_lock(&ctx->mutex);
+		file_idx = ctx->next_file_idx++;
+		pthread_mutex_unlock(&ctx->mutex);
+
+		if (file_idx >= ctx->argc)
+			break;
+
+		ret = -decompress_file(d, ctx->argv[file_idx], ctx->options);
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->overall_ret |= ret;
+		pthread_mutex_unlock(&ctx->mutex);
+	}
+
+	libdeflate_free_decompressor(d);
+	return NULL;
+}
+#endif
+
 int
 tmain(int argc, tchar *argv[])
 {
@@ -564,6 +648,7 @@ tmain(int argc, tchar *argv[])
 	options.keep = false;
 	options.test = false;
 	options.compression_level = -1;
+	options.num_threads = 1;
 	options.suffix = T(".gz");
 
 	while ((opt_char = tgetopt(argc, argv, optstring)) != -1) {
@@ -605,6 +690,15 @@ tmain(int argc, tchar *argv[])
 			 *  option as a no-op.
 			 */
 			break;
+#ifdef HAVE_PTHREAD
+		case 'p':
+			options.num_threads = (int)tstrtoul(toptarg, NULL, 10);
+			if (options.num_threads < 1) {
+				msg("invalid thread count");
+				return 1;
+			}
+			break;
+#endif
 		case 'q':
 			suppress_warnings = true;
 			break;
@@ -648,6 +742,36 @@ tmain(int argc, tchar *argv[])
 	}
 
 	ret = 0;
+#ifdef HAVE_PTHREAD
+	if (options.num_threads > 1 && argc > 1 && !options.to_stdout) {
+		int num_threads = options.num_threads < argc ? options.num_threads : argc;
+		pthread_t *threads = xmalloc(num_threads * sizeof(pthread_t));
+		struct thread_worker_ctx ctx;
+		memset(&ctx, 0, sizeof(ctx));
+		ctx.options = &options;
+		ctx.argv = argv;
+		ctx.argc = argc;
+		ctx.next_file_idx = 0;
+		ctx.overall_ret = 0;
+		pthread_mutex_init(&ctx.mutex, NULL);
+
+		for (i = 0; i < num_threads; i++) {
+			if (options.decompress) {
+				pthread_create(&threads[i], NULL, decompress_worker_thread, &ctx);
+			} else {
+				pthread_create(&threads[i], NULL, compress_worker_thread, &ctx);
+			}
+		}
+
+		for (i = 0; i < num_threads; i++) {
+			pthread_join(threads[i], NULL);
+		}
+
+		pthread_mutex_destroy(&ctx.mutex);
+		free(threads);
+		ret = ctx.overall_ret;
+	} else
+#endif
 	if (options.decompress) {
 		struct libdeflate_decompressor *d;
 
